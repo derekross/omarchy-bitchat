@@ -5,8 +5,8 @@
 //! - `$XDG_STATE_HOME/omarchy-bitchat/messages.jsonl`: recent public chat.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -86,20 +86,36 @@ impl Store {
         Store { data_dir, state_dir }
     }
 
+    /// Create the folder if needed. It must be a real folder we own, not a
+    /// symlink; it's then made private (0700).
     fn ensure_dir(dir: &Path) -> Result<()> {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        let meta = fs::symlink_metadata(dir)?;
+        if !meta.is_dir() || meta.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!("{} must be a folder you own, not a link", dir.display());
+        }
+        if meta.permissions().mode() & 0o777 != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        }
         Ok(())
     }
 
     /// Load our identity, creating (and saving) a new one on first run.
     pub fn load_identity(&self) -> Result<(Identity, String)> {
         let path = self.data_dir.join("identity.json");
-        if let Ok(text) = fs::read_to_string(&path) {
-            let file: IdentityFile = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-            let noise = decode_key(&file.noise_secret).context("bad noiseSecret")?;
-            let signing = decode_key(&file.signing_secret).context("bad signingSecret")?;
-            return Ok((Identity::from_secrets(noise, signing), file.nickname));
+        match read_small(&path, 64 * 1024) {
+            Ok(text) => {
+                let file: IdentityFile =
+                    serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+                let noise = decode_key(&file.noise_secret).context("bad noiseSecret")?;
+                let signing = decode_key(&file.signing_secret).context("bad signingSecret")?;
+                return Ok((Identity::from_secrets(noise, signing), file.nickname));
+            }
+            // Only a missing file means "first run". Any other error (a
+            // permission problem, a disk error) must not quietly replace
+            // the user's identity with a new one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("reading {}", path.display()))),
         }
         let id = Identity::generate();
         let nickname = format!("anon{}", &id.peer_id().hex()[..4]);
@@ -118,7 +134,7 @@ impl Store {
     }
 
     pub fn load_settings(&self) -> Settings {
-        fs::read_to_string(self.state_dir.join("settings.json"))
+        read_small(&self.state_dir.join("settings.json"), 64 * 1024)
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default()
@@ -133,40 +149,81 @@ impl Store {
         self.state_dir.join("messages.jsonl")
     }
 
-    /// The last [`LOG_MAX`] messages. Compacts the file when it has grown
-    /// well past that.
+    /// The last [`LOG_MAX`] messages, read from at most the last
+    /// [`HISTORY_MAX_BYTES`] of the file. Compacts the file when it has
+    /// grown well past that.
     pub fn load_history(&self) -> Vec<ChatMessage> {
-        let Ok(file) = File::open(self.history_path()) else {
+        let Ok(mut file) = open_nofollow(&self.history_path()) else {
             return Vec::new();
         };
-        let all: Vec<ChatMessage> = BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|l| serde_json::from_str(&l).ok())
-            .collect();
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let skip = len.saturating_sub(HISTORY_MAX_BYTES);
+        if skip > 0 && file.seek(SeekFrom::Start(skip)).is_err() {
+            return Vec::new();
+        }
+        let mut lines = BufReader::new(file).lines().map_while(Result::ok);
+        if skip > 0 {
+            lines.next(); // probably a partial line
+        }
+        let all: Vec<ChatMessage> = lines.filter_map(|l| serde_json::from_str(&l).ok()).collect();
         let keep = all[all.len().saturating_sub(LOG_MAX)..].to_vec();
-        if all.len() > LOG_MAX * 2 {
+        if all.len() > LOG_MAX * 2 || skip > 0 {
             let _ = self.rewrite_history(&keep);
         }
         keep
     }
 
-    pub fn append_history(&self, msg: &ChatMessage) -> Result<()> {
+    /// Append one message. Returns true when the file has grown enough that
+    /// the caller should compact it with [`Store::rewrite_history`].
+    pub fn append_history(&self, msg: &ChatMessage) -> Result<bool> {
         Self::ensure_dir(&self.state_dir)?;
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(self.history_path())?;
         writeln!(f, "{}", serde_json::to_string(msg)?)?;
-        Ok(())
+        Ok(f.metadata()?.len() > HISTORY_MAX_BYTES)
     }
 
+    /// Peer IDs and the signing key each first used (see `Mesh::pins`).
+    pub fn load_pins(&self) -> Vec<(bitchat_proto::PeerId, [u8; 32])> {
+        let Ok(text) = read_small(&self.state_dir.join("peers.json"), 2 * 1024 * 1024) else {
+            return Vec::new();
+        };
+        let pairs: Vec<(String, String)> = serde_json::from_str(&text).unwrap_or_default();
+        pairs
+            .iter()
+            .filter_map(|(id, key)| Some((bitchat_proto::PeerId::from_hex(id)?, decode_key(key)?)))
+            .collect()
+    }
+
+    pub fn save_pins(&self, pins: &[(bitchat_proto::PeerId, [u8; 32])]) -> Result<()> {
+        Self::ensure_dir(&self.state_dir)?;
+        let pairs: Vec<(String, String)> =
+            pins.iter().map(|(id, key)| (id.hex(), bitchat_proto::peer_id::hex(key))).collect();
+        write_atomic(&self.state_dir.join("peers.json"), serde_json::to_string(&pairs)?.as_bytes())
+    }
+
+    /// Rewrite the file with the newest messages that fit in half of
+    /// [`HISTORY_MAX_BYTES`] (so it doesn't need compacting again at once).
     pub fn rewrite_history(&self, msgs: &[ChatMessage]) -> Result<()> {
         Self::ensure_dir(&self.state_dir)?;
-        let mut body = String::new();
-        for m in msgs {
-            body.push_str(&serde_json::to_string(m)?);
+        let budget = (HISTORY_MAX_BYTES / 2) as usize;
+        let mut lines: Vec<String> = Vec::new();
+        let mut size = 0;
+        for m in msgs.iter().rev() {
+            let line = serde_json::to_string(m)?;
+            if size + line.len() + 1 > budget {
+                break;
+            }
+            size += line.len() + 1;
+            lines.push(line);
+        }
+        lines.reverse();
+        let mut body = lines.join("\n");
+        if !body.is_empty() {
             body.push('\n');
         }
         write_atomic(&self.history_path(), body.as_bytes())
@@ -191,21 +248,54 @@ fn decode_key(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Write via a 0600 temp file and rename, so a crash never leaves half a file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+/// Most of the history file we ever read back.
+pub const HISTORY_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+fn open_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+/// Read a small file, refusing symlinks and anything over `max` bytes.
+fn read_small(path: &Path, max: u64) -> std::io::Result<String> {
+    let f = open_nofollow(path)?;
+    let mut text = String::new();
+    f.take(max + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "file too large"));
     }
-    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(text)
+}
+
+/// Write via a fresh 0600 temp file with an unpredictable name (created
+/// exclusively, never through a link) and rename it over `path`, so a crash
+/// never leaves half a file and nothing at a guessable name is followed.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let dir = path.parent().context("path has no parent")?;
+    let name = path.file_name().context("path has no file name")?.to_string_lossy();
+    let mut attempt = 0;
+    let (tmp, mut f) = loop {
+        let tmp = dir.join(format!(".{name}.{:016x}", rand::random::<u64>()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => attempt += 1,
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("writing next to {}", path.display()))),
+        }
+    };
+    let written = f.write_all(bytes).and_then(|_| f.sync_all());
+    drop(f);
+    if let Err(e) = written.and_then(|_| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(anyhow::Error::from(e).context(format!("replacing {}", path.display())));
+    }
+    if let Ok(d) = File::open(dir) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -213,15 +303,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn temp_store(name: &str) -> Store {
-        let base = std::env::temp_dir().join(format!("bitchatd-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        Store::at(base.join("data"), base.join("state"))
+    /// A store in a fresh private temp folder, removed when dropped.
+    fn temp_store() -> (tempfile::TempDir, Store) {
+        let base = tempfile::tempdir().unwrap();
+        let store = Store::at(base.path().join("data"), base.path().join("state"));
+        (base, store)
     }
 
     #[test]
     fn identity_persists_with_private_permissions() {
-        let s = temp_store("identity");
+        let (_tmp, s) = temp_store();
         let (a, nick) = s.load_identity().unwrap();
         assert!(nick.starts_with("anon"));
         let (b, nick2) = s.load_identity().unwrap();
@@ -233,7 +324,7 @@ mod tests {
 
     #[test]
     fn settings_round_trip_and_defaults() {
-        let s = temp_store("settings");
+        let (_tmp, s) = temp_store();
         assert_eq!(s.load_settings(), Settings::default());
         let custom = Settings { mode: Mode::Saver, persist_history: false };
         s.save_settings(&custom).unwrap();
@@ -241,8 +332,29 @@ mod tests {
     }
 
     #[test]
+    fn history_compacts_to_a_byte_budget() {
+        let (_tmp, s) = temp_store();
+        let big = |i: usize| ChatMessage {
+            id: format!("{i}"),
+            sender_id: "aa".into(),
+            nickname: "n".into(),
+            text: "\"".repeat(4000), // escapes to 8000 bytes of JSON
+            timestamp: i as u64,
+            mine: false,
+        };
+        let msgs: Vec<_> = (0..500).map(big).collect();
+        s.rewrite_history(&msgs).unwrap();
+        let len = fs::metadata(s.history_path()).unwrap().len();
+        assert!(len <= HISTORY_MAX_BYTES / 2, "{len}");
+        // Appending stays under the threshold for a while: no rewrite storm.
+        assert!(!s.append_history(&big(501)).unwrap());
+        let back = s.load_history();
+        assert_eq!(back.last().unwrap().id, "501");
+    }
+
+    #[test]
     fn history_append_load_clear() {
-        let s = temp_store("history");
+        let (_tmp, s) = temp_store();
         for i in 0..3 {
             s.append_history(&ChatMessage {
                 id: format!("{i}"),

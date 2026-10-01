@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Test stub: logs the call. `show` answers like systemd after a
+# daemon-reload: the unit at our path if it is there, unless FAKE_FRAGMENT /
+# FAKE_EXECSTART / FAKE_LOAD say otherwise. is-active answers FAKE_ACTIVE_RC.
+echo "systemctl $*" >>"${FAKE_LOG:-/dev/null}"
+unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/bitchat.service"
+case "$2" in
+  is-active) exit "${FAKE_ACTIVE_RC:-3}" ;;
+  show)
+    frag='' exec='' load=not-found
+    if [[ -L $unit && $(readlink -- "$unit") == /dev/null ]]; then
+      frag=/dev/null load=masked
+    elif [[ -f $unit ]]; then
+      frag=$unit load=loaded
+      bin="$(sed -n 's/^ExecStart=//p' "$unit" 2>/dev/null | head -1)"; bin=${bin//%h/$HOME}
+      [[ -n $bin ]] && exec="{ path=$bin ; argv[]=$bin ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }"
+    fi
+    [[ -n ${FAKE_FRAGMENT+x} ]] && frag=$FAKE_FRAGMENT
+    [[ -n ${FAKE_EXECSTART+x} ]] && exec=$FAKE_EXECSTART
+    [[ -n ${FAKE_LOAD+x} ]] && load=$FAKE_LOAD
+    printf 'FragmentPath=%s\nExecStart=%s\nLoadState=%s\n' "$frag" "$exec" "$load" ;;
+esac
+exit 0

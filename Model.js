@@ -8,18 +8,45 @@ var MAX_MESSAGES = 300
 // Messages from one sender closer together than this share a header.
 var GROUP_GAP_MS = 5 * 60 * 1000
 
-function shortId(peerId) {
-  return String(peerId || "").slice(0, 4)
+function shortId(peerId, long) {
+  return String(peerId || "").slice(0, long ? 8 : 4)
 }
 
 // "alice#1a2b": the nickname plus enough of the peer ID to tell two
-// alices apart, the convention bitchat uses.
-function displayName(nickname, peerId) {
+// alices apart, the convention bitchat uses. Four hex digits are easy to
+// match by brute force, so when a nickname is `ambiguous` (two peers use
+// it) eight are shown.
+function displayName(nickname, peerId, ambiguous) {
   var nick = String(nickname || "").trim()
   if (nick === "") nick = "anon"
-  var tag = shortId(peerId)
+  var tag = shortId(peerId, ambiguous === true)
   return tag === "" ? nick : nick + "#" + tag
 }
+
+// Nicknames (lowercased) that more than one peer is using: { "alice": true }.
+function ambiguousNames(peers) {
+  var seen = {}
+  var out = {}
+  for (var i = 0; i < (peers ? peers.length : 0); i++) {
+    var key = String(peers[i].nickname || "").trim().toLowerCase()
+    if (seen[key]) out[key] = true
+    seen[key] = true
+  }
+  return out
+}
+
+function isAmbiguous(map, nickname) {
+  return !!map && map[String(nickname || "").trim().toLowerCase()] === true
+}
+
+// For the notification card, which renders a little markup: shown as typed.
+function escapeMarkup(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;")
+}
+
+// At most one desktop notification this often; more are folded into it.
+var NOTIFY_MIN_GAP_MS = 10 * 1000
 
 // A stable hue in [0, 1) per peer, so each sender keeps a color.
 function nickHue(peerId) {

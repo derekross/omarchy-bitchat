@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Test stub: "builds" by copying the placeholder binaries into the target
+# dir. Refuses to write anywhere but a test HOME.
+echo "cargo $* CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-}" >>"${FAKE_LOG:-/dev/null}"
+[[ -n ${CARGO_TARGET_DIR:-} && -n ${FAKE_BINS:-} && $CARGO_TARGET_DIR == "$HOME"/* && -f $HOME/.bitchat-test-home ]] \
+  || { echo "cargo stub: refusing to build outside a test HOME (CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-unset})" >&2; exit 101; }
+mkdir -p -- "$CARGO_TARGET_DIR/release"
+cp -- "$FAKE_BINS/bitchatd" "$FAKE_BINS/bitchatctl" "$CARGO_TARGET_DIR/release/"

@@ -87,9 +87,40 @@ impl MessageType {
 pub struct WirePayload {
     pub bytes: Vec<u8>,
     pub compressed: bool,
-    /// The decoded payload these bytes stand for; replacing the payload
-    /// invalidates them.
-    pub for_payload: Vec<u8>,
+    /// SHA-256 of the decoded payload these bytes stand for; replacing the
+    /// payload invalidates them. (A hash, not a second copy of the payload.)
+    pub for_payload: [u8; 32],
+}
+
+impl WirePayload {
+    pub fn new(bytes: Vec<u8>, compressed: bool, payload: &[u8]) -> WirePayload {
+        WirePayload { bytes, compressed, for_payload: payload_hash(payload) }
+    }
+}
+
+fn payload_hash(payload: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(payload).into()
+}
+
+/// The most payload (after decompression) we accept per message type.
+/// The protocol allows 10 MiB; nothing this node handles needs more than a
+/// file transfer's ~1 MiB, and chat types need far less. Checked against
+/// the declared size before anything is inflated.
+pub fn max_payload_for(ptype: u8) -> usize {
+    match MessageType::from_u8(ptype) {
+        // As iOS's PacketPayloadLimits: the apps send public messages of up
+        // to ~60 KB (one v1 frame), so anything smaller would drop them.
+        Some(MessageType::Announce) => 4 * 1024,
+        Some(MessageType::Message) => 128 * 1024,
+        Some(MessageType::Leave) => 256,
+        Some(MessageType::RequestSync) => 2 * 1024,
+        Some(MessageType::NoiseHandshake) => 1024,
+        // One fragment of a frame: never more than a frame.
+        Some(MessageType::Fragment) => 4 * 1024,
+        // Files, voice, Noise-wrapped files and anything unknown we only carry.
+        _ => 1024 * 1024 + 64 * 1024,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,7 +184,7 @@ impl Packet {
         let compressed_buf;
         let mut compressed = false;
         match &self.wire {
-            Some(wire) if wire.for_payload == self.payload => {
+            Some(wire) if wire.for_payload == payload_hash(&self.payload) => {
                 if wire.compressed {
                     body = &wire.bytes;
                     compressed = true;
@@ -345,7 +376,8 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
     let has_route = v2 && flag_bits & flags::HAS_ROUTE != 0;
     let rsr = flag_bits & flags::IS_RSR != 0;
     let payload_len = if v2 { r.u32()? as usize } else { r.u16()? as usize };
-    if payload_len > crate::MAX_PAYLOAD_LENGTH {
+    let limit = max_payload_for(ptype);
+    if payload_len > crate::MAX_PAYLOAD_LENGTH || payload_len > limit + 4 {
         return None;
     }
 
@@ -365,7 +397,7 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
             return None;
         }
         let original = if v2 { r.u32()? as usize } else { r.u16()? as usize };
-        if original == 0 || original > crate::MAX_PAYLOAD_LENGTH {
+        if original == 0 || original > limit {
             return None;
         }
         let body = r.take(payload_len - size_field)?;
@@ -373,11 +405,11 @@ fn decode_core(raw: &[u8]) -> Option<Packet> {
             return None;
         }
         let payload = compression::decompress(body, original)?;
-        let wire = WirePayload { bytes: body.to_vec(), compressed: true, for_payload: payload.clone() };
+        let wire = WirePayload::new(body.to_vec(), true, &payload);
         (payload, wire)
     } else {
         let payload = r.take(payload_len)?.to_vec();
-        let wire = WirePayload { bytes: Vec::new(), compressed: false, for_payload: payload.clone() };
+        let wire = WirePayload::new(Vec::new(), false, &payload);
         (payload, wire)
     };
 
@@ -497,7 +529,7 @@ mod tests {
         let payload = "aaaa".repeat(40).into_bytes();
         let mut p = base();
         p.payload = payload.clone();
-        p.wire = Some(WirePayload { bytes: Vec::new(), compressed: false, for_payload: payload });
+        p.wire = Some(WirePayload::new(Vec::new(), false, &payload));
         let bytes = p.encode(false).unwrap();
         assert_eq!(bytes[11] & flags::IS_COMPRESSED, 0);
         let back = Packet::decode(&bytes).unwrap();
@@ -517,6 +549,24 @@ mod tests {
         p.route = vec![PeerId([3; 8]), PeerId([4; 8])];
         let bytes = p.encode(true).unwrap();
         assert_eq!(Packet::frame_len(&bytes), Some(padding::unpad(&bytes).len()));
+    }
+
+    #[test]
+    fn oversized_payloads_rejected_per_type() {
+        // A 10 MiB message of 'A's compresses to ~10 KB; it must not decode.
+        let mut p = base();
+        p.version = 2;
+        p.payload = vec![b'A'; 10 * 1024 * 1024];
+        let bytes = p.encode(false).unwrap();
+        assert!(bytes.len() < 20_000);
+        assert!(Packet::decode(&bytes).is_none());
+        // The apps' longest message (~60 KB) still decodes.
+        p.payload = vec![b'A'; 60_000];
+        assert!(Packet::decode(&p.encode(false).unwrap()).is_some());
+        // An announce can't be big.
+        p.ptype = MessageType::Announce as u8;
+        p.payload = vec![1; 5000];
+        assert!(Packet::decode(&p.encode(false).unwrap()).is_none());
     }
 
     #[test]
@@ -565,6 +615,8 @@ mod tests {
         // High-entropy so it will not compress below the limit.
         p.payload = (0..70_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
         assert!(matches!(p.encode(false), Err(EncodeError::V1Overflow(_))));
+        // Big enough to need v2, so a type that may be big (files).
+        p.ptype = MessageType::FileTransfer as u8;
         p.version = 2;
         let bytes = p.encode(false).unwrap();
         assert_eq!(Packet::decode(&bytes).unwrap().payload, p.payload);

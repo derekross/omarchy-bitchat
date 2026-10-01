@@ -1,7 +1,7 @@
 //! bitchatd: a bitchat BLE mesh node for the Omarchy bar.
 //!
 //! Runs as a systemd user service. Owns the Bluetooth side (via BlueZ) and
-//! the mesh; the bar plugin talks to it over `$XDG_RUNTIME_DIR/bitchat.sock`.
+//! the mesh; the bar plugin talks to it over `$XDG_RUNTIME_DIR/bitchat/bitchat.sock`.
 
 mod ble;
 mod ipc;
@@ -46,13 +46,15 @@ async fn main() -> Result<()> {
     );
 
     let socket = ipc::socket_path()?;
-    let listener = ipc::bind(&socket).await?;
+    let bound = ipc::bind(&socket).await?;
 
-    let mesh = Mesh::new(identity, nickname, history);
+    let pins = store.load_pins();
+    let mesh = Mesh::with_pins(identity, nickname, history, pins);
     let (node, out_rx) = Node::new(mesh, store, settings);
 
     tokio::spawn(node::ticker(node.clone()));
     tokio::spawn(ble::supervise(node.clone(), out_rx));
+    let (listener, bound) = bound.split();
     let server = tokio::spawn(ipc::serve(node.clone(), listener));
 
     let mut term = signal(SignalKind::terminate())?;
@@ -68,7 +70,7 @@ async fn main() -> Result<()> {
     // Say goodbye so peers drop us now rather than after a timeout.
     node.send_raw(node.leave_packet(), Target::All);
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let _ = std::fs::remove_file(&socket);
+    bound.remove();
     tracing::info!("stopped");
     Ok(())
 }

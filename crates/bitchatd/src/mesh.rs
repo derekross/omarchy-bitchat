@@ -48,6 +48,28 @@ pub const SYNC_REPLY_COOLDOWN_MS: u64 = 10_000;
 pub const SYNC_REPLY_MAX: usize = 300;
 pub const SYNC_REPLY_PACING_MS: u64 = 25;
 pub const NICKNAME_MAX: usize = 15;
+/// Longest public message we show, in bytes. Longer ones (the apps allow
+/// ~60 KB) are still relayed, but shown cut short with a marker.
+pub const MESSAGE_SHOW_MAX: usize = 16 * 1024;
+/// Most peers we track. Announces are cheap to forge, so the table is
+/// bounded; the oldest peer without a link goes first.
+pub const PEERS_MAX: usize = 300;
+/// Signing keys we remember per peer ID (trust on first use).
+pub const PINS_MAX: usize = 5_000;
+/// New pins allowed per minute: flushing the pin table with throwaway
+/// identities would take hours, and real peers refresh theirs when seen.
+pub const PINS_PER_MINUTE: usize = 30;
+/// Sync requests older than this are refused (replays are also caught by
+/// the seen-set for this long).
+pub const SYNC_REQUEST_MAX_AGE_MS: u64 = 300_000;
+/// Bytes of messages kept for answering sync requests.
+pub const SYNC_STORE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Total sync replies we send across all links per window.
+pub const SYNC_BUDGET: usize = 600;
+pub const SYNC_BUDGET_WINDOW_MS: u64 = 60_000;
+/// Seen-set for packets we carry but can't verify: separate, so junk can't
+/// evict the IDs of verified packets.
+pub const UNVERIFIED_SEEN_MAX: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
@@ -110,6 +132,8 @@ struct Peer {
     links: HashSet<LinkId>,
     /// When the last direct link went away, if it has.
     unlinked_at: Option<u64>,
+    /// Timestamp of the newest announce accepted from this peer.
+    announced_at: u64,
 }
 
 pub struct Mesh {
@@ -131,12 +155,29 @@ pub struct Mesh {
     sync_ids: HashSet<[u8; 16]>,
     sync_announces: HashMap<PeerId, Packet>,
     sync_replied: HashMap<PeerId, u64>,
+    sync_replied_link: HashMap<LinkId, u64>,
+    sync_sent: VecDeque<u64>,
     next_sync: u64,
     cleared_before: u64,
+    seen_unverified: SeenSet,
+    /// Trust on first use: the signing key first seen for each peer ID,
+    /// kept across restarts. Forged announces can't take over an ID we've
+    /// already met.
+    pins: HashMap<PeerId, [u8; 32]>,
+    pin_order: VecDeque<PeerId>,
+    pin_times: VecDeque<u64>,
+    pins_dirty: bool,
+    sync_bytes: usize,
+    peers_dirty: bool,
 }
 
 impl Mesh {
+    #[cfg(test)]
     pub fn new(me: Identity, nickname: String, history: Vec<ChatMessage>) -> Mesh {
+        Mesh::with_pins(me, nickname, history, Vec::new())
+    }
+
+    pub fn with_pins(me: Identity, nickname: String, history: Vec<ChatMessage>, pins: Vec<(PeerId, [u8; 32])>) -> Mesh {
         let my_id = me.peer_id();
         let mut mesh = Mesh {
             me,
@@ -155,12 +196,26 @@ impl Mesh {
             sync_ids: HashSet::new(),
             sync_announces: HashMap::new(),
             sync_replied: HashMap::new(),
+            sync_replied_link: HashMap::new(),
+            sync_sent: VecDeque::new(),
             next_sync: 0,
             cleared_before: 0,
+            seen_unverified: SeenSet::with_capacity(UNVERIFIED_SEEN_MAX),
+            pins: HashMap::new(),
+            pin_order: VecDeque::new(),
+            pin_times: VecDeque::new(),
+            pins_dirty: false,
+            sync_bytes: 0,
+            peers_dirty: false,
         };
         for m in history {
             mesh.push_log(m);
         }
+        for (id, key) in pins {
+            mesh.pins.insert(id, key);
+            mesh.pin_order.push_back(id);
+        }
+        mesh.pins_dirty = false;
         mesh
     }
 
@@ -209,6 +264,65 @@ impl Mesh {
         out
     }
 
+    /// The pinned keys, when they changed since the last call (to save).
+    pub fn take_dirty_pins(&mut self) -> Option<Vec<(PeerId, [u8; 32])>> {
+        if !self.pins_dirty {
+            return None;
+        }
+        self.pins_dirty = false;
+        Some(self.pin_order.iter().filter_map(|id| self.pins.get(id).map(|k| (*id, *k))).collect())
+    }
+
+    /// Pin a new peer's key, if the rate limit allows. Least recently seen
+    /// pins are evicted first (see [`Mesh::refresh_pin`]).
+    fn pin(&mut self, id: PeerId, key: [u8; 32], now: u64) -> bool {
+        while self.pin_times.front().is_some_and(|t| now.saturating_sub(*t) > 60_000) {
+            self.pin_times.pop_front();
+        }
+        if self.pin_times.len() >= PINS_PER_MINUTE {
+            return false;
+        }
+        self.pin_times.push_back(now);
+        self.pins.insert(id, key);
+        self.pin_order.push_back(id);
+        while self.pin_order.len() > PINS_MAX {
+            if let Some(old) = self.pin_order.pop_front() {
+                self.pins.remove(&old);
+            }
+        }
+        self.pins_dirty = true;
+        true
+    }
+
+    /// A pinned peer was just verified: move it to the back of the eviction
+    /// order, so peers we actually meet aren't the ones flushed out.
+    fn refresh_pin(&mut self, id: PeerId) {
+        if self.pin_order.back() == Some(&id) {
+            return;
+        }
+        if let Some(pos) = self.pin_order.iter().position(|p| *p == id) {
+            self.pin_order.remove(pos);
+            self.pin_order.push_back(id);
+            self.pins_dirty = true;
+        }
+    }
+
+    /// Forget a peer and its pinned key (the user trusts a new key for it).
+    pub fn forget(&mut self, id: PeerId) -> bool {
+        let pinned = self.pins.remove(&id).is_some();
+        self.pin_order.retain(|p| *p != id);
+        let known = self.peers.remove(&id).is_some();
+        self.link_peer.retain(|_, p| *p != id);
+        self.sync_announces.remove(&id);
+        if pinned {
+            self.pins_dirty = true;
+        }
+        if known {
+            self.peers_dirty = true;
+        }
+        pinned || known
+    }
+
     /// Peer ID bound to a link by a direct (TTL 7) announce, if any.
     pub fn link_peer(&self, link: LinkId) -> Option<PeerId> {
         self.link_peer.get(&link).copied()
@@ -234,13 +348,15 @@ impl Mesh {
         let Some(peer_id) = self.link_peer.remove(&link) else {
             return Vec::new();
         };
+        self.sync_replied_link.remove(&link);
         if let Some(peer) = self.peers.get_mut(&peer_id) {
             peer.links.remove(&link);
             if peer.links.is_empty() {
                 peer.unlinked_at = Some(now);
             }
         }
-        vec![self.peers_event()]
+        self.peers_dirty = true;
+        Vec::new()
     }
 
     /// Periodic housekeeping; call about once a second.
@@ -264,8 +380,15 @@ impl Mesh {
         if self.peers.len() != before {
             let peers = &self.peers;
             self.link_peer.retain(|_, id| peers.contains_key(id));
-            out.push(self.peers_event());
+            self.peers_dirty = true;
         }
+        // Peer changes go out at most once a tick: a flood of announces
+        // can't turn into a flood of full peer lists for every client.
+        if self.peers_dirty {
+            self.peers_dirty = false;
+            out.push(Effect::Event(Event::Peers(self.peers())));
+        }
+        self.seen_unverified.prune(now);
 
         if !self.links.is_empty() && now >= self.next_announce {
             out.push(Effect::Send { packet: self.announce(), target: Target::All, delay: Duration::ZERO });
@@ -276,14 +399,20 @@ impl Mesh {
         // Backfilled packets can be older than ones already stored, so the
         // store isn't time-ordered: prune by age everywhere, not from the front.
         let ids = &mut self.sync_ids;
+        let bytes = &mut self.sync_bytes;
         self.sync_msgs.retain(|p| {
             let keep = now.saturating_sub(p.timestamp) <= MESSAGE_MAX_AGE_MS;
             if !keep {
                 ids.remove(&packet_id(p));
+                *bytes -= p.payload.len();
             }
             keep
         });
         self.sync_replied.retain(|_, at| now.saturating_sub(*at) <= SYNC_REPLY_COOLDOWN_MS);
+        self.sync_replied_link.retain(|_, at| now.saturating_sub(*at) <= SYNC_REPLY_COOLDOWN_MS);
+        while self.sync_sent.front().is_some_and(|at| now.saturating_sub(*at) > SYNC_BUDGET_WINDOW_MS) {
+            self.sync_sent.pop_front();
+        }
         if !self.links.is_empty() && now >= self.next_sync {
             if self.next_sync != 0 {
                 out.push(Effect::Send { packet: self.sync_request(now), target: Target::All, delay: Duration::ZERO });
@@ -318,9 +447,11 @@ impl Mesh {
         if !self.sync_ids.insert(packet_id(packet)) {
             return;
         }
+        self.sync_bytes += packet.payload.len();
         self.sync_msgs.push_back(packet.clone());
-        while self.sync_msgs.len() > SYNC_STORE_MAX {
+        while self.sync_msgs.len() > SYNC_STORE_MAX || self.sync_bytes > SYNC_STORE_MAX_BYTES {
             if let Some(old) = self.sync_msgs.pop_front() {
+                self.sync_bytes -= old.payload.len();
                 self.sync_ids.remove(&packet_id(&old));
             }
         }
@@ -330,8 +461,17 @@ impl Mesh {
     /// back on the same link with TTL 0 and the RSR flag (iOS drops old
     /// packets without it).
     fn answer_sync(&mut self, link: LinkId, packet: &Packet, now: u64, out: &mut Vec<Effect>) {
-        // Only from the neighbor on this link, signed by its known key.
+        // Only from the neighbor on this link, signed by its known key, and
+        // fresh (a captured request can't be replayed later). The cooldown
+        // is per link as well as per peer, so rebinding a link to a fresh
+        // identity doesn't reset it.
         if self.link_peer.get(&link) != Some(&packet.sender) {
+            return;
+        }
+        if now.abs_diff(packet.timestamp) > SYNC_REQUEST_MAX_AGE_MS {
+            return;
+        }
+        if self.sync_replied_link.get(&link).is_some_and(|at| now.saturating_sub(*at) < SYNC_REPLY_COOLDOWN_MS) {
             return;
         }
         let Some(key) = self.peers.get(&packet.sender).map(|p| p.signing_key) else {
@@ -352,6 +492,7 @@ impl Mesh {
             return;
         }
         self.sync_replied.insert(packet.sender, now);
+        self.sync_replied_link.insert(link, now);
         let filter = req.filter();
 
         let mut missing: Vec<&Packet> = Vec::new();
@@ -367,8 +508,15 @@ impl Mesh {
         // Announces first so the messages after them verify.
         missing.sort_by_key(|p| (p.ptype != MessageType::Announce as u8, p.timestamp));
 
-        for (i, p) in missing.into_iter().take(SYNC_REPLY_MAX).enumerate() {
-            let mut reply = p.clone();
+        // A global budget too: many links asking at once can't make us
+        // flood the radio.
+        let budget = SYNC_BUDGET.saturating_sub(self.sync_sent.len()).min(SYNC_REPLY_MAX);
+        let replies: Vec<Packet> = missing.into_iter().take(budget).cloned().collect();
+        for _ in &replies {
+            self.sync_sent.push_back(now);
+        }
+        for (i, p) in replies.into_iter().enumerate() {
+            let mut reply = p;
             reply.ttl = 0;
             reply.rsr = true;
             out.push(Effect::Send {
@@ -447,15 +595,15 @@ impl Mesh {
         let ptype = MessageType::from_u8(packet.ptype);
         let id = packet_id(&packet);
         let is_direct_announce = ptype == Some(MessageType::Announce) && packet.ttl == MAX_TTL;
-        if self.seen.contains(&id) && !is_direct_announce {
+        if (self.seen.contains(&id) || self.seen_unverified.contains(&id)) && !is_direct_announce {
             return;
         }
 
         match ptype {
             Some(MessageType::Fragment) => {
-                self.seen.insert(id, now);
+                self.seen_unverified.insert(id, now);
                 self.maybe_relay(link, &packet, age, rng, out);
-                if let Some(whole) = self.reassembler.push(&packet, now) {
+                if let Some(whole) = self.reassembler.push(&packet, now, link) {
                     self.on_packet(link, whole, now, rng, out);
                 }
             }
@@ -504,7 +652,7 @@ impl Mesh {
                 // A LEAVE with a payload leaves a channel, not the mesh.
                 if packet.payload.is_empty() && self.peers.remove(&packet.sender).is_some() {
                     self.link_peer.retain(|_, p| *p != packet.sender);
-                    out.push(self.peers_event());
+                    self.peers_dirty = true;
                 }
                 self.maybe_relay(link, &packet, age, rng, out);
             }
@@ -521,15 +669,16 @@ impl Mesh {
                 self.maybe_relay(link, &packet, age, rng, out);
             }
             Some(MessageType::RequestSync) => {
-                // Neighbor-only: never relayed, never recorded as seen (a
-                // peer asks again with the same payload).
+                // Neighbor-only and never relayed. Recorded so a captured
+                // copy can't be replayed at us.
+                self.seen_unverified.insert(id, now);
                 self.answer_sync(link, &packet, now, out);
             }
             _ => {
                 // Noise traffic and types we don't speak: carry them for
-                // others, never consume them.
-                self.seen.insert(id, now);
-                self.touch(packet.sender, now);
+                // others, never consume them. Unauthenticated, so they
+                // neither refresh a peer nor touch the verified seen-set.
+                self.seen_unverified.insert(id, now);
                 self.maybe_relay(link, &packet, age, rng, out);
             }
         }
@@ -546,6 +695,26 @@ impl Mesh {
         let nickname = sanitize_nickname(&ann.nickname).unwrap_or_else(|| format!("anon{}", &packet.sender.hex()[..4]));
         let direct = packet.ttl == MAX_TTL;
 
+        // Trust on first use, across restarts: a peer ID we've met keeps the
+        // signing key it first used. (The protocol doesn't prove the sender
+        // holds the Noise key, so this is what stops a takeover.) New pins are
+        // made below, only for peers that announce directly over a link.
+        let pinned = match self.pins.get(&packet.sender) {
+            Some(key) if *key != signing => {
+                tracing::warn!("rejected an announce for {} with a different signing key", packet.sender);
+                return false;
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if pinned {
+            self.refresh_pin(packet.sender);
+        }
+        // Newest announce yet from this peer? Replays of older ones may still
+        // refresh it, but don't rename it or bind a link. (Ordering, not wall
+        // clock: off-grid phones' clocks drift by minutes.)
+        let newest = self.peers.get(&packet.sender).is_none_or(|p| packet.timestamp >= p.announced_at);
+
         let mut changed = false;
         match self.peers.get_mut(&packet.sender) {
             Some(peer) => {
@@ -553,13 +722,21 @@ impl Mesh {
                 if peer.signing_key != signing || peer.noise_key != noise {
                     return false;
                 }
-                if peer.nickname != nickname {
-                    peer.nickname = nickname;
-                    changed = true;
+                // Only newer announces update the peer: a replayed old one
+                // can't roll a nickname back.
+                if packet.timestamp > peer.announced_at {
+                    peer.announced_at = packet.timestamp;
+                    if peer.nickname != nickname {
+                        peer.nickname = nickname;
+                        changed = true;
+                    }
                 }
                 peer.last_seen = now;
             }
             None => {
+                if self.peers.len() >= PEERS_MAX && !self.evict_one_peer() {
+                    return false;
+                }
                 self.peers.insert(
                     packet.sender,
                     Peer {
@@ -569,13 +746,19 @@ impl Mesh {
                         last_seen: now,
                         links: HashSet::new(),
                         unlinked_at: None,
+                        announced_at: packet.timestamp,
                     },
                 );
                 changed = true;
             }
         }
 
-        if direct && self.links.contains(&link) {
+        // Binding a link takes the peer's newest announce: an old one replayed
+        // with its TTL reset to 7 (TTL isn't signed) can't claim a link.
+        if direct && newest && self.links.contains(&link) {
+            if !pinned {
+                self.pin(packet.sender, signing, now);
+            }
             if let Some(old) = self.link_peer.insert(link, packet.sender)
                 && old != packet.sender
                 && let Some(p) = self.peers.get_mut(&old)
@@ -595,9 +778,29 @@ impl Mesh {
             }
         }
         if changed {
-            out.push(self.peers_event());
+            self.peers_dirty = true;
         }
         true
+    }
+
+    /// Make room in the peer table: drop the least recently seen peer that
+    /// has no direct link. False when every peer is linked.
+    fn evict_one_peer(&mut self) -> bool {
+        let victim = self
+            .peers
+            .iter()
+            .filter(|(_, p)| p.links.is_empty())
+            .min_by_key(|(_, p)| p.last_seen)
+            .map(|(id, _)| *id);
+        match victim {
+            Some(id) => {
+                self.peers.remove(&id);
+                self.sync_announces.remove(&id);
+                self.peers_dirty = true;
+                true
+            }
+            None => false,
+        }
     }
 
     fn handle_public(&mut self, packet: &Packet, id: [u8; 16], out: &mut Vec<Effect>) {
@@ -607,6 +810,7 @@ impl Mesh {
         let Ok(text) = String::from_utf8(packet.payload.clone()) else {
             return;
         };
+        let text = clean_message(&text);
         let nickname = self
             .peers
             .get(&packet.sender)
@@ -684,16 +888,49 @@ impl Mesh {
         true
     }
 
-    fn peers_event(&self) -> Effect {
-        Effect::Event(Event::Peers(self.peers()))
+}
+
+/// Characters that reorder or hide text: bidi overrides and isolates,
+/// zero-width spaces and joiners, the BOM, soft hyphens. Nicknames drop all
+/// of them: a name must look like what it is.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}'
+        | '\u{200B}'..='\u{200F}'
+        | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}'
+        | '\u{FEFF}')
+}
+
+/// Bidi overrides and isolates only: in message text, zero-width joiners
+/// and non-joiners are needed (emoji sequences, Persian and Indic shaping).
+fn is_bidi_control(c: char) -> bool {
+    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// A stranger's message as we show and store it: no bidi overrides, no
+/// control characters but newline and tab, and cut at [`MESSAGE_SHOW_MAX`]
+/// bytes with a marker.
+pub fn clean_message(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MESSAGE_SHOW_MAX));
+    for c in s.chars() {
+        if is_bidi_control(c) || (c.is_control() && c != '\n' && c != '\t') {
+            continue;
+        }
+        if out.len() + c.len_utf8() > MESSAGE_SHOW_MAX {
+            out.push_str(" … (cut short)");
+            break;
+        }
+        out.push(c);
     }
+    out
 }
 
 /// Trim, drop control characters, and cap at 15 characters like the apps.
 pub fn sanitize_nickname(nick: &str) -> Option<String> {
     let clean: String = nick
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible(*c))
         .collect::<String>()
         .trim()
         .chars()
@@ -1075,6 +1312,200 @@ mod tests {
         assert!(messages(&deliver(&said, &mut a, 1, NOW + 20)).is_empty());
         let later = b.send_text("after", NOW + 30);
         assert_eq!(messages(&deliver(&later, &mut a, 1, NOW + 30)).len(), 1);
+    }
+
+    #[test]
+    fn pinned_key_survives_restart_and_blocks_takeover() {
+        let mut a = node("alice");
+        let b = node("bob");
+        introduce(&mut a, &b, 1);
+        let pins = a.take_dirty_pins().unwrap();
+        assert_eq!(pins, vec![(b.peer_id(), b.me.signing_public())]);
+        assert!(a.take_dirty_pins().is_none());
+
+        // Restart with the saved pins; bob is long gone from the table.
+        let mut a2 = Mesh::with_pins(Identity::generate(), "alice".into(), Vec::new(), pins);
+        a2.on_link_up(1);
+        // Mallory announces bob's Noise key with her own signing key.
+        let fake = Identity::from_secrets(b.me.noise_secret_bytes(), [9; 32]);
+        let mut ann = fake.announce_packet("bob", vec![]);
+        ann.timestamp = NOW;
+        fake.sign(&mut ann);
+        a2.on_frame(1, &wire(&ann), NOW, &mut rng());
+        assert!(a2.peers().is_empty());
+    }
+
+    #[test]
+    fn replayed_older_announce_does_not_bind_a_link() {
+        let mut a = node("alice");
+        let b = node("bob");
+        let mut old = b.announce();
+        old.timestamp = NOW - 30_000;
+        b.me.sign(&mut old);
+        let mut new = b.announce();
+        new.timestamp = NOW;
+        b.me.sign(&mut new);
+        a.on_link_up(1);
+        a.on_link_up(2);
+        a.on_frame(1, &wire(&new), NOW, &mut rng());
+        // Mallory replays bob's older announce, TTL reset to 7, on her link.
+        a.on_frame(2, &wire(&old), NOW + 1, &mut rng());
+        assert_eq!(a.link_peer(1), Some(b.peer_id()));
+        assert_eq!(a.link_peer(2), None);
+    }
+
+    #[test]
+    fn phone_with_a_skewed_clock_still_binds() {
+        let mut a = node("alice");
+        let b = node("bob");
+        a.on_link_up(1);
+        let mut ann = b.announce();
+        ann.timestamp = NOW - 5 * 60_000; // phone clock five minutes slow
+        b.me.sign(&mut ann);
+        a.on_frame(1, &wire(&ann), NOW, &mut rng());
+        assert_eq!(a.link_peer(1), Some(b.peer_id()));
+        assert!(a.peers()[0].direct);
+    }
+
+    #[test]
+    fn pins_are_rate_limited_and_only_from_direct_links() {
+        let mut a = node("alice");
+        a.on_link_up(1);
+        // Relayed announces don't pin.
+        let r = node("relayed");
+        let mut ann = r.announce();
+        ann.timestamp = NOW;
+        ann.ttl = 5;
+        r.me.sign(&mut ann);
+        a.on_frame(1, &wire(&ann), NOW, &mut rng());
+        assert!(a.take_dirty_pins().is_none());
+        // Many direct identities in a minute: only PINS_PER_MINUTE pinned.
+        for i in 0..(PINS_PER_MINUTE + 10) as u64 {
+            let p = node("spam");
+            let mut ann = p.announce();
+            ann.timestamp = NOW + i;
+            p.me.sign(&mut ann);
+            a.on_frame(1, &wire(&ann), NOW + i, &mut rng());
+        }
+        assert_eq!(a.take_dirty_pins().unwrap().len(), PINS_PER_MINUTE);
+    }
+
+    #[test]
+    fn forget_drops_the_pin() {
+        let mut a = node("alice");
+        let b = node("bob");
+        introduce(&mut a, &b, 1);
+        assert!(a.forget(b.peer_id()));
+        assert!(a.peers().is_empty());
+        assert!(a.take_dirty_pins().unwrap().is_empty());
+        assert!(!a.forget(b.peer_id()));
+    }
+
+    #[test]
+    fn replayed_old_announce_cannot_roll_back_nickname() {
+        let mut a = node("alice");
+        let mut b = node("bob");
+        let mut old = b.announce();
+        old.timestamp = NOW - 1_000;
+        b.me.sign(&mut old);
+        b.set_nickname("robert").unwrap();
+        let mut new = b.announce();
+        new.timestamp = NOW;
+        b.me.sign(&mut new);
+        a.on_link_up(1);
+        a.on_frame(1, &wire(&new), NOW, &mut rng());
+        a.on_frame(1, &wire(&old), NOW, &mut rng());
+        assert_eq!(a.peers()[0].nickname, "robert");
+    }
+
+    #[test]
+    fn peer_table_is_bounded() {
+        let mut a = node("alice");
+        a.on_link_up(1);
+        for i in 0..(PEERS_MAX + 20) {
+            let p = node("spam");
+            let mut ann = p.announce();
+            ann.timestamp = NOW + i as u64;
+            ann.ttl = 5;
+            p.me.sign(&mut ann);
+            a.on_frame(1, &wire(&ann), NOW + i as u64, &mut rng());
+        }
+        assert_eq!(a.peers().len(), PEERS_MAX);
+        // One peers event per tick, however many announces arrived.
+        let fx = a.tick(NOW + 1_000, &mut rng());
+        let events = fx.iter().filter(|e| matches!(e, Effect::Event(Event::Peers(_)))).count();
+        assert_eq!(events, 1);
+    }
+
+    #[test]
+    fn rebinding_a_link_does_not_reset_the_sync_cooldown() {
+        let (alice, mut bob, _) = sync_pair(3);
+        let req = alice.sync_request(NOW);
+        assert!(!sends(&bob.on_frame(7, &wire(&req), NOW, &mut rng())).is_empty());
+        // Mallory takes over link 7 with a fresh identity and asks again.
+        let mallory = node("mallory");
+        let mut ann = mallory.announce();
+        ann.timestamp = NOW + 1;
+        mallory.me.sign(&mut ann);
+        bob.on_frame(7, &wire(&ann), NOW + 1, &mut rng());
+        let req2 = mallory.sync_request(NOW + 2);
+        let replies = sends(&bob.on_frame(7, &wire(&req2), NOW + 2, &mut rng()))
+            .into_iter()
+            .filter(|(p, _)| p.rsr)
+            .count();
+        assert_eq!(replies, 0);
+    }
+
+    #[test]
+    fn replayed_sync_request_is_ignored() {
+        let (alice, mut bob, _) = sync_pair(3);
+        let req = alice.sync_request(NOW);
+        bob.on_frame(7, &wire(&req), NOW, &mut rng());
+        bob.sync_replied.clear();
+        bob.sync_replied_link.clear();
+        // Same bytes again: already seen.
+        assert!(sends(&bob.on_frame(7, &wire(&req), NOW + 20_000, &mut rng())).is_empty());
+        // A request older than the relay window is ignored too.
+        let old = alice.sync_request(NOW - SYNC_REQUEST_MAX_AGE_MS - 1);
+        assert!(sends(&bob.on_frame(7, &wire(&old), NOW + 20_000, &mut rng())).is_empty());
+    }
+
+    #[test]
+    fn oversized_and_disguised_messages() {
+        let mut a = node("alice");
+        let mut b = node("bob");
+        introduce(&mut a, &b, 1);
+        // Long messages (the apps allow ~60 KB) show, cut short.
+        let long = "x".repeat(MESSAGE_SHOW_MAX + 100);
+        let mut p = b.me.message_packet(&long);
+        p.timestamp = NOW;
+        b.me.sign(&mut p);
+        let got = a.on_frame(1, &wire(&p), NOW, &mut rng());
+        let shown = &messages(&got)[0].text;
+        assert!(shown.len() <= MESSAGE_SHOW_MAX + 20 && shown.ends_with("(cut short)"));
+        // Bidi overrides and controls go; joiners (emoji, shaping) stay.
+        let fx = b.send_text("safe\u{202E}txt.exe\u{1b}[2J 👨\u{200D}💻", NOW + 1);
+        let got = deliver(&fx, &mut a, 1, NOW + 1);
+        assert_eq!(messages(&got)[0].text, "safetxt.exe[2J 👨\u{200D}💻");
+        assert_eq!(sanitize_nickname("ad\u{202E}min").as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn unverified_traffic_does_not_keep_peers_alive() {
+        let mut a = node("alice");
+        let b = node("bob");
+        a.on_link_up(1);
+        let mut ann = b.announce();
+        ann.timestamp = NOW;
+        ann.ttl = 5;
+        b.me.sign(&mut ann);
+        a.on_frame(1, &wire(&ann), NOW, &mut rng());
+        // Forged noise traffic "from" bob, right before he'd go stale.
+        let mut hs = Packet::new(MessageType::NoiseHandshake, b.peer_id(), vec![0; 32]);
+        hs.timestamp = NOW + PEER_STALE_MS - 10;
+        a.on_frame(1, &wire(&hs), NOW + PEER_STALE_MS - 10, &mut rng());
+        a.tick(NOW + PEER_STALE_MS + 1, &mut rng());
+        assert!(a.peers().is_empty());
     }
 
     #[test]

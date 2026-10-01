@@ -75,6 +75,7 @@ pub struct Node {
     out: mpsc::UnboundedSender<Outgoing>,
     radio: watch::Sender<RadioStatus>,
     mode: watch::Sender<Mode>,
+    last_compaction: Mutex<Option<std::time::Instant>>,
 }
 
 impl Node {
@@ -89,6 +90,7 @@ impl Node {
             events,
             out,
             radio: watch::Sender::new(RadioStatus::default()),
+            last_compaction: Mutex::new(None),
         };
         (Arc::new(node), out_rx)
     }
@@ -129,7 +131,12 @@ impl Node {
     }
 
     pub fn tick(&self) {
-        let fx = self.with_mesh(|m, rng| m.tick(bitchat_proto::now_ms(), rng));
+        let (fx, pins) = self.with_mesh(|m, rng| (m.tick(bitchat_proto::now_ms(), rng), m.take_dirty_pins()));
+        if let Some(pins) = pins
+            && let Err(e) = self.store.save_pins(&pins)
+        {
+            tracing::warn!("saving pinned keys: {e:#}");
+        }
         self.apply(fx);
     }
 
@@ -182,6 +189,17 @@ impl Node {
         Ok(())
     }
 
+    /// Forget a peer and its pinned signing key, so a new key for that peer
+    /// ID is accepted (a phone that reset its keys, say).
+    pub fn forget_peer(&self, id: &str) -> Result<bool, String> {
+        let id = bitchat_proto::PeerId::from_hex(id).ok_or("peer id must be 16 hex digits")?;
+        let (forgot, pins) = self.with_mesh(|m, _| (m.forget(id), m.take_dirty_pins()));
+        if let Some(pins) = pins {
+            self.store.save_pins(&pins).map_err(|e| e.to_string())?;
+        }
+        Ok(forgot)
+    }
+
     pub fn clear_history(&self) -> Result<(), String> {
         self.with_mesh(|m, _| m.clear_history(bitchat_proto::now_ms()));
         self.store.clear_history().map_err(|e| e.to_string())?;
@@ -192,6 +210,16 @@ impl Node {
     /// The LEAVE we send on the way out.
     pub fn leave_packet(&self) -> Packet {
         self.with_mesh(|m, _| m.leave())
+    }
+
+    /// At most one history compaction a minute, whatever the traffic.
+    fn compaction_due(&self) -> bool {
+        let mut last = self.last_compaction.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t: std::time::Instant| t.elapsed() < Duration::from_secs(60)) {
+            return false;
+        }
+        *last = Some(std::time::Instant::now());
+        true
     }
 
     pub fn radio_status(&self) -> RadioStatus {
@@ -249,10 +277,20 @@ impl Node {
                 Effect::Event(event) => {
                     if let Event::Message(msg) = &event {
                         let persist = self.settings.lock().unwrap_or_else(|e| e.into_inner()).persist_history;
-                        if persist
-                            && let Err(e) = self.store.append_history(msg) {
-                                tracing::warn!("saving history: {e:#}");
+                        if persist {
+                            match self.store.append_history(msg) {
+                                // Grown past its cap: rewrite it from the
+                                // in-memory log (the last 500 messages).
+                                Ok(true) if self.compaction_due() => {
+                                    let msgs: Vec<_> = self.with_mesh(|m, _| m.messages().cloned().collect());
+                                    if let Err(e) = self.store.rewrite_history(&msgs) {
+                                        tracing::warn!("compacting history: {e:#}");
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(e) => tracing::warn!("saving history: {e:#}"),
                             }
+                        }
                     }
                     if let Ok(v) = serde_json::to_value(&event) {
                         let _ = self.events.send(v);

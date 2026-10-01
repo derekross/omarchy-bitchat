@@ -25,15 +25,25 @@ pub fn packet_id(packet: &Packet) -> [u8; 16] {
 }
 
 /// Time- and size-bounded set of packet IDs already handled.
-#[derive(Default)]
 pub struct SeenSet {
     seen: HashMap<[u8; 16], u64>,
     order: VecDeque<([u8; 16], u64)>,
+    cap: usize,
+}
+
+impl Default for SeenSet {
+    fn default() -> SeenSet {
+        SeenSet::new()
+    }
 }
 
 impl SeenSet {
     pub fn new() -> SeenSet {
-        SeenSet::default()
+        SeenSet::with_capacity(SEEN_CAPACITY)
+    }
+
+    pub fn with_capacity(cap: usize) -> SeenSet {
+        SeenSet { seen: HashMap::new(), order: VecDeque::new(), cap }
     }
 
     pub fn contains(&self, id: &[u8; 16]) -> bool {
@@ -52,7 +62,7 @@ impl SeenSet {
     pub fn prune(&mut self, now_ms: u64) {
         while let Some(&(id, at)) = self.order.front() {
             let expired = now_ms.saturating_sub(at) > SEEN_TTL_MS;
-            if !expired && self.order.len() <= SEEN_CAPACITY {
+            if !expired && self.order.len() <= self.cap {
                 break;
             }
             self.order.pop_front();

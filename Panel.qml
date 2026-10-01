@@ -31,6 +31,8 @@ Panel {
   readonly property var me: service ? service.me : ({})
   readonly property var peers: service ? service.peers : []
   readonly property var radio: service ? service.radio : ({})
+  // Nicknames two peers share: shown with a longer ID tag.
+  readonly property var ambiguous: Model.ambiguousNames(peers)
   // Appended to in place (not rebuilt per message), so reading back
   // through history isn't yanked to the bottom by each new line.
   ListModel { id: chatModel }
@@ -294,6 +296,18 @@ Panel {
           }
         }
 
+        // ---- Daemon older than the plugin.
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          visible: root.linked && root.service && root.service.outdatedDaemon
+          wrapMode: Text.WordWrap
+          text: "bitchatd is older than this plugin. Run dist/install.sh from the plugin folder to update it."
+          color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+
         // ---- Daemon not running.
         Column {
           width: parent.width
@@ -449,7 +463,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: Model.displayName(modelData.nickname, modelData.id)
+                text: Model.displayName(modelData.nickname, modelData.id, Model.isAmbiguous(root.ambiguous, modelData.nickname))
                 color: root.nickColor(modelData.id)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -519,7 +533,7 @@ Panel {
 
               Text {
                 textFormat: Text.PlainText
-                text: row.mine ? "you" : Model.displayName(row.nickname, row.senderId)
+                text: row.mine ? "you" : Model.displayName(row.nickname, row.senderId, Model.isAmbiguous(root.ambiguous, row.nickname))
                 color: row.mine ? Color.accent : root.nickColor(row.senderId)
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption

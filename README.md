@@ -42,7 +42,9 @@ omarchy plugin add https://github.com/derekross/omarchy-bitchat
 omarchy plugin enable derekross.bitchat --section right
 ```
 
-`install.sh` builds `bitchatd` (the daemon) and `bitchatctl` (a command-line client) and puts them in `~/.local/bin`. It installs and starts the `bitchat.service` user unit and links the plugin in place. It never uses sudo. It won't overwrite a file it didn't write unless you pass `--replace-existing`, and in that case it keeps a backup.
+`install.sh` builds `bitchatd` (the daemon) and `bitchatctl` (a command-line client) and puts them in `~/.local/bin`. It also installs the `bitchat.service` user unit (and starts it on first install) and links the plugin in place. No sudo or pkexec is required; nothing is downloaded except the crates cargo fetches while building.
+
+The scripts only ever replace or remove a file whose SHA-256 matches what they installed: the record lives in `~/.local/state/omarchy-bitchat/installed.tsv`, and earlier versions of the unit are listed in `dist/known-hashes.tsv`. Anything else at those paths is yours. They refuse it and tell you so, and won't follow symlinks. To replace one of your files there, pass `--replace-existing=<path>`; it is moved to `~/.local/state/omarchy-bitchat/backup/`, and no script ever deletes that folder. The service is stopped, restarted or disabled only when systemd confirms it is this unit running this binary.
 
 From a checkout instead: `git clone … && cd omarchy-bitchat && ./dist/install.sh`, which also links the checkout into `~/.config/omarchy/plugins`.
 
@@ -65,6 +67,7 @@ bitchatctl peers
 bitchatctl send hello mesh
 bitchatctl tail            # follow the chat
 bitchatctl mode saver      # auto | balanced | saver | off
+bitchatctl forget <id>     # forget a peer's pinned key (it reset its keys)
 omarchy-shell derekross.bitchat toggle   # for a keybinding
 ```
 
@@ -78,23 +81,34 @@ omarchy plugin update derekross.bitchat
 ## Remove
 
 ```bash
-~/.config/omarchy/plugins/derekross.bitchat/dist/uninstall.sh      # --purge also deletes your identity and history
+~/.config/omarchy/plugins/derekross.bitchat/dist/uninstall.sh      # --purge also deletes your identity, history and settings (never backups)
 omarchy plugin remove derekross.bitchat
 ```
 
 ## Privacy and security
 
+**What leaves the machine:** only Bluetooth LE traffic to devices in range. There is no internet traffic, telemetry or account. No sudo or pkexec is required.
+
 - **Public is public.** `#mesh` messages are signed but not encrypted, like on the phone apps. Anyone in range running bitchat can read them, and so can anyone listening to Bluetooth.
-- **Your identity** is a pair of keys made on first run: Curve25519 for Noise and Ed25519 for signing. They're in `~/.local/share/omarchy-bitchat/identity.json` (mode 0600) and never leave the machine. Your peer ID is derived from the Noise key. Delete the file, or `uninstall.sh --purge`, to start over as someone new.
-- **Your laptop advertises** a bitchat service while the mesh is on. Nearby devices can tell a bitchat node is there, though not who you are beyond your nickname. Off stops all advertising.
-- **Only what verifies.** Messages and announces whose signature doesn't check out are dropped and never relayed. A peer can't take over a known peer ID with a different key.
-- **The control socket** (`$XDG_RUNTIME_DIR/bitchat.sock`) only accepts connections from your own user.
-- **The daemon runs sandboxed** (see `dist/bitchat.service`): it can write only its own data and state folders, can open only Unix sockets (Bluetooth goes through BlueZ over D-Bus), and never dumps core.
+- **Your identity** is a pair of keys made on first run: Curve25519 for Noise and Ed25519 for signing. They're in `~/.local/share/omarchy-bitchat/identity.json` (mode 0600) and never leave the machine. Your peer ID is derived from the Noise key. `uninstall.sh --purge` deletes it, so you start over as someone new.
+- **What nearby devices can see.** While the mesh is on, your laptop advertises a bitchat service (only the service UUID, no name). It does so from your adapter's address, which on most laptops is fixed, so the laptop can be recognised over time. Anyone who connects can also read the adapter's Bluetooth name (`bluetoothctl show`, "Alias"). To blur both, set `Privacy = device` in `/etc/bluetooth/main.conf` and give the adapter a neutral alias. Off stops all advertising, scanning and connections.
+- **Only what verifies.** Messages and announces whose signature doesn't check out are dropped and never relayed.
+- **Trust on first use.** The protocol doesn't prove that a peer owns the Noise key it announces, so a peer ID could be claimed by a stranger who got there first. The daemon remembers the signing key each peer ID first used over a direct link and refuses a different one later, even after a restart. These keys are kept in `~/.local/state/omarchy-bitchat/peers.json`, up to 5,000 peer IDs, whether or not history is kept; `--purge` deletes the file. If someone you know reset their app's keys, `bitchatctl forget <peer-id>` accepts their new one. Names show `#` plus 4 hex digits of the peer ID, or 8 when two peers share a nickname, because 4 digits are easy to match deliberately. Treat names on a public mesh as claims, not proof.
+- **Bounded against floods.** Everything a stranger in range can make the daemon hold is capped: message and packet sizes (as the iOS app caps them), peers, fragments per link, queued replies and history on disk. The service is also limited to 256 MB of memory. Files larger than about 1 MiB, which only Android-to-Android transfers produce, aren't carried through this node.
+- **Text from strangers is shown as text.** The panel renders it as plain text, notifications escape markup and are rate-limited, `bitchatctl` escapes terminal control characters, and invisible bidi and zero-width characters are stripped.
+- **History** of `#mesh` (the last 500 messages, including strangers') is kept in `~/.local/state/omarchy-bitchat/messages.jsonl` (mode 0600). Turn off "Keep chat history" to stop saving and delete it.
+- **The control socket** (`$XDG_RUNTIME_DIR/bitchat/bitchat.sock`) accepts only your own user. Any program running as you can therefore post to `#mesh` through it. That's no more than such a program could already do, since it can also read your identity file.
+- **The daemon runs sandboxed** (see `dist/bitchat.service`):
+  - Your home is an empty tmpfs, with only the binary and its two state folders mapped in.
+  - It can't reach your session bus or systemd user manager.
+  - It can open only Unix sockets; Bluetooth goes through BlueZ over the system D-Bus.
+  - It has no devices and is limited in memory and tasks.
+  - It never dumps core.
 
 ## How it works
 
 ```
-phones ⇄ BLE ⇄ BlueZ ⇄ D-Bus ⇄ bitchatd ⇄ bitchat.sock (JSON lines) ⇄ Service.qml ⇄ bar + panel
+phones ⇄ BLE ⇄ BlueZ ⇄ D-Bus ⇄ bitchatd ⇄ bitchat/bitchat.sock (JSON lines) ⇄ Service.qml ⇄ bar + panel
 ```
 
 - `crates/bitchat-proto` implements the bitchat wire protocol, byte-compatible with [bitchat-android](https://github.com/permissionlesstech/bitchat-android) and [bitchat for iOS](https://github.com/permissionlesstech/bitchat): packets v1 and v2, padding, raw-deflate compression, Ed25519 signing, fragmentation, announces, dedup, relay policy and GCS gossip sync. It's pure and unit-tested.

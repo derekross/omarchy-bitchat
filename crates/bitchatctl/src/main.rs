@@ -17,6 +17,7 @@ usage: bitchatctl <command>
   log [n]           the last n messages (default 20)
   nick <name>       change your nickname
   mode <mode>       auto | balanced | saver | off
+  forget <peer-id>  forget a peer and the signing key pinned for it
   json <method> [params-json]   raw request, prints the JSON reply";
 
 fn main() {
@@ -53,7 +54,7 @@ fn run() -> Result<()> {
             for p in peers {
                 println!(
                     "{:<16} {}  {}",
-                    p["nickname"].as_str().unwrap_or("?"),
+                    safe(p["nickname"].as_str().unwrap_or("?")),
                     p["id"].as_str().unwrap_or("?"),
                     if p["direct"].as_bool() == Some(true) { "direct" } else { "via mesh" }
                 );
@@ -90,6 +91,11 @@ fn run() -> Result<()> {
             let nick = rest.join(" ");
             client.call("setNickname", json!({ "nickname": nick }))?;
         }
+        "forget" => {
+            let id = rest.first().ok_or_else(|| anyhow!("forget needs a peer id (bitchatctl peers)"))?;
+            let forgot = client.call("forgetPeer", json!({ "peerId": id }))?;
+            println!("{}", if forgot.as_bool() == Some(true) { "forgotten" } else { "not known" });
+        }
         "mode" => {
             let mode = rest.first().ok_or_else(|| anyhow!("mode needs auto, balanced, saver or off"))?;
             client.call("setMode", json!({ "mode": mode }))?;
@@ -117,10 +123,26 @@ fn print_message(m: &Value) {
     let (h, min) = ((ts / 3600) % 24, (ts / 60) % 60);
     println!(
         "{h:02}:{min:02} UTC <{}> {}",
-        m["nickname"].as_str().unwrap_or("?"),
-        m["text"].as_str().unwrap_or("")
+        safe(m["nickname"].as_str().unwrap_or("?")),
+        safe(m["text"].as_str().unwrap_or(""))
     );
 }
+
+/// Text from strangers, made safe for a terminal: control characters (escape
+/// sequences that could rewrite the screen, the title or the clipboard, and
+/// newlines that could fake a line from someone else) are shown escaped.
+fn safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => out.push_str(&c.escape_unicode().to_string()),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 
 struct Client {
     reader: BufReader<UnixStream>,
@@ -131,7 +153,7 @@ struct Client {
 impl Client {
     fn connect() -> Result<Client> {
         let dir = std::env::var_os("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR is not set")?;
-        let path = PathBuf::from(dir).join("bitchat.sock");
+        let path = PathBuf::from(dir).join("bitchat").join("bitchat.sock");
         let stream = UnixStream::connect(&path).with_context(|| {
             format!("can't reach bitchatd at {} (systemctl --user start bitchat)", path.display())
         })?;
@@ -160,5 +182,18 @@ impl Client {
             }
             return Ok(v["result"].clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe;
+
+    #[test]
+    fn escapes_terminal_controls() {
+        assert_eq!(safe("hi"), "hi");
+        assert_eq!(safe("a\nb"), "a\\nb");
+        assert_eq!(safe("\u{1b}]52;c;Zm9v\u{7}"), "\\u{1b}]52;c;Zm9v\\u{7}");
+        assert_eq!(safe("\u{9b}2J"), "\\u{9b}2J");
     }
 }

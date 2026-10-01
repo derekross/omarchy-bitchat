@@ -82,8 +82,8 @@ mod tests {
 
     #[test]
     fn battery_detection() {
-        let base = std::env::temp_dir().join(format!("bitchatd-ps-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
         std::fs::create_dir_all(base.join("BAT0")).unwrap();
         std::fs::write(base.join("BAT0/type"), "Battery\n").unwrap();
         assert!(!on_battery_in(&base), "no mains listed = desktop = AC");

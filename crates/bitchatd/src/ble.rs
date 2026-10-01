@@ -57,6 +57,11 @@ const MONITOR_INTERVAL: Duration = Duration::from_secs(3);
 const POWER_INTERVAL: Duration = Duration::from_secs(15);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_WRITE_BUFFER: usize = 64 * 1024;
+/// Most notification frames waiting at once.
+const MAX_NOTIFY_QUEUE: usize = 512;
+/// A link whose far end hasn't announced itself by now is dropped: it's
+/// holding a slot without taking part in the mesh.
+const ANNOUNCE_DEADLINE: Duration = Duration::from_secs(20);
 /// Retry a failed radio session after 5 s, doubling up to 5 minutes.
 const RETRY_BASE: Duration = Duration::from_secs(5);
 const RETRY_MAX: Duration = Duration::from_secs(300);
@@ -103,7 +108,18 @@ struct Radio {
     suppressed: Mutex<HashMap<Address, Instant>>,
     write_bufs: Mutex<HashMap<Address, Vec<u8>>>,
     notifier: tokio::sync::Mutex<Option<CharacteristicNotifier>>,
+    /// Frames waiting for the notifier.
+    notify_queued: Arc<std::sync::atomic::AtomicUsize>,
     tasks: Mutex<JoinSet<()>>,
+}
+
+/// Gives `n` back to a counter when dropped: when its task finishes, is
+/// aborted, or is dropped before it ever ran.
+struct Release(Arc<std::sync::atomic::AtomicUsize>, usize);
+impl Drop for Release {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::Relaxed);
+    }
 }
 
 static NEXT_LINK: AtomicU64 = AtomicU64::new(1);
@@ -119,6 +135,7 @@ impl Radio {
             suppressed: Mutex::new(HashMap::new()),
             write_bufs: Mutex::new(HashMap::new()),
             notifier: tokio::sync::Mutex::new(None),
+            notify_queued: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tasks: Mutex::new(JoinSet::new()),
         })
     }
@@ -152,7 +169,11 @@ impl Radio {
         {
             let links = self.lock_links();
             for (&id, link) in links.iter() {
-                if let LinkKind::Peripheral { mtu } = link.kind {
+                // A central that never raised its MTU can't carry a frame at
+                // all; it mustn't shrink notifications for everyone else.
+                if let LinkKind::Peripheral { mtu } = link.kind
+                    && mtu.saturating_sub(3) >= MIN_FRAME
+                {
                     peripheral_min_mtu = Some(peripheral_min_mtu.map_or(mtu, |m: usize| m.min(mtu)));
                 }
                 let selected = match out.target {
@@ -183,13 +204,25 @@ impl Radio {
             // BlueZ cuts each notification to the central's ATT MTU - 3.
             let max_frame = peripheral_min_mtu.map_or(FRAGMENT_THRESHOLD, |mtu| frame_limit(mtu.saturating_sub(3)));
             let frames = frames(&out.packet, max_frame);
+            // Bounded: when the radio can't keep up (a flood), drop rather
+            // than queue without limit.
+            let queued = self.notify_queued.fetch_add(frames.len(), Ordering::Relaxed);
+            if queued + frames.len() > MAX_NOTIFY_QUEUE {
+                self.notify_queued.fetch_sub(frames.len(), Ordering::Relaxed);
+                tracing::debug!("notify queue full; dropping a packet");
+                return;
+            }
+            // Created before the task, so the count comes back even if the
+            // task is aborted before its first poll.
+            let release = Release(self.notify_queued.clone(), frames.len());
             let radio = self.clone();
             self.spawn(async move {
+                let _release = release;
+                let count = frames.len();
                 let mut guard = radio.notifier.lock().await;
                 let Some(notifier) = guard.as_mut() else {
                     return;
                 };
-                let count = frames.len();
                 for (i, frame) in frames.into_iter().enumerate() {
                     if notifier.notify(frame).await.is_err() {
                         *guard = None;
@@ -556,6 +589,29 @@ impl Radio {
                     self.node.on_link_down(id);
                 }
             }
+
+            // Links that never produced a valid announce.
+            let silent: Vec<(Address, Arc<Notify>)> = self
+                .lock_links()
+                .iter()
+                .filter(|(id, l)| l.since.elapsed() > ANNOUNCE_DEADLINE && self.node.link_peer(**id).is_none())
+                .filter_map(|(_, l)| match &l.kind {
+                    LinkKind::Central { close, .. } => Some((l.addr, close.clone())),
+                    LinkKind::Peripheral { .. } => None,
+                })
+                .collect();
+            for (addr, close) in silent {
+                tracing::info!("{addr} never announced itself; dropping the link");
+                self.suppressed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(addr, Instant::now() + DUPLICATE_BACKOFF);
+                close.notify_one();
+            }
+            self.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|_, (_, until)| Instant::now() < *until + Duration::from_secs(600));
 
             let mut by_peer: HashMap<bitchat_proto::PeerId, Vec<(Instant, Address, Arc<Notify>)>> = HashMap::new();
             for (&id, link) in self.lock_links().iter() {

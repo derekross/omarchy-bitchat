@@ -1,5 +1,6 @@
-# Installed by omarchy-bitchat (https://github.com/derekross/omarchy-bitchat);
-# install.sh and uninstall.sh only replace or remove this file while this line is here.
+# Installed by omarchy-bitchat (https://github.com/derekross/omarchy-bitchat).
+# install.sh and uninstall.sh replace or remove this file only while its bytes
+# match a version they installed; edit it and it's yours.
 [Unit]
 Description=bitchat Bluetooth mesh node for the Omarchy bar
 Documentation=https://github.com/derekross/omarchy-bitchat
@@ -9,35 +10,51 @@ After=graphical-session.target bluetooth.target
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/bitchatd
-# Fixed paths, so they always match ReadWritePaths below whatever XDG says.
+# Fixed paths, so they always match BindPaths below whatever XDG says.
 Environment=BITCHAT_DATA_DIR=%h/.local/share/omarchy-bitchat
 Environment=BITCHAT_STATE_DIR=%h/.local/state/omarchy-bitchat
 Restart=on-failure
 RestartSec=3
 
-# Hardening. The daemon needs: its data and state dirs, the runtime dir for
-# its socket, and the system bus (BlueZ). Bluetooth itself goes through
-# bluetoothd, so no Bluetooth sockets or capabilities are needed here.
+# Hardening. The daemon needs: its two state folders, its runtime folder
+# (the socket), the system bus (BlueZ) and /sys/class/power_supply. Bluetooth
+# itself goes through bluetoothd, so no Bluetooth sockets or capabilities.
+# Home is an empty tmpfs with only the binary and those folders mapped in,
+# so a compromised daemon can't read the rest of it (BLE could exfiltrate).
+# That tmpfs covers /run/user too: the session bus and the user manager's
+# private socket (which could start something outside this sandbox) are
+# out of reach, and the socket lives in its own RuntimeDirectory.
 NoNewPrivileges=yes
 PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=-%h/.local/share/omarchy-bitchat -%h/.local/state/omarchy-bitchat %t
+ProtectHome=tmpfs
+BindReadOnlyPaths=%h/.local/bin/bitchatd
+BindPaths=%h/.local/share/omarchy-bitchat %h/.local/state/omarchy-bitchat
+RuntimeDirectory=bitchat
+RuntimeDirectoryMode=0700
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 RestrictAddressFamilies=AF_UNIX
-RestrictNamespaces=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
+# Bounded, so a flood from a hostile peer can't take the machine's memory.
+MemoryMax=256M
+TasksMax=64
 # The identity keys live in this process: never write core dumps.
 LimitCORE=0
 UMask=0077

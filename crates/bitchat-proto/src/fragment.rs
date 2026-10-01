@@ -16,6 +16,10 @@ pub const MAX_FRAGMENT_DATA: usize = 469;
 pub const MAX_FRAGMENTS_PER_ID: usize = 256;
 pub const MAX_SET_BYTES: usize = 1024 * 1024;
 pub const MAX_ACTIVE_SETS: usize = 64;
+/// One link can hold this many sets open; more evicts its own. Keyed on the
+/// link the fragments arrived on, which (unlike the sender ID in an unsigned
+/// fragment) a peer can't rotate.
+pub const MAX_SETS_PER_ORIGIN: usize = 8;
 pub const MAX_GLOBAL_BYTES: usize = 4 * 1024 * 1024;
 pub const TIMEOUT_MS: u64 = 30_000;
 
@@ -116,6 +120,7 @@ pub fn split(packet: &Packet, max_frame: usize) -> Option<Vec<Packet>> {
 }
 
 struct Assembly {
+    origin: u64,
     original_type: u8,
     total: u16,
     parts: HashMap<u16, Vec<u8>>,
@@ -136,9 +141,10 @@ impl Reassembler {
         Reassembler::default()
     }
 
-    /// Feed one FRAGMENT packet. Returns the reassembled packet, with TTL 0
-    /// so it is not relayed again (the fragments themselves are relayed).
-    pub fn push(&mut self, fragment: &Packet, now_ms: u64) -> Option<Packet> {
+    /// Feed one FRAGMENT packet that arrived from `origin` (the transport's
+    /// link). Returns the reassembled packet, with TTL 0 so it is not relayed
+    /// again (the fragments themselves are relayed).
+    pub fn push(&mut self, fragment: &Packet, now_ms: u64, origin: u64) -> Option<Packet> {
         let f = FragmentPayload::decode(&fragment.payload)?;
         if f.total as usize > MAX_FRAGMENTS_PER_ID {
             return None;
@@ -150,12 +156,31 @@ impl Reassembler {
                 return None;
             }
         } else {
-            if self.sets.len() >= MAX_ACTIVE_SETS {
-                return None;
+            // Make room: at its quota, a link loses one of its own sets;
+            // otherwise, when every slot is taken, the set furthest from done
+            // goes (least received, then newest), so a long transfer that's
+            // nearly complete isn't the one a flood pushes out.
+            let own = self.sets.values().filter(|s| s.origin == origin).count();
+            let victim = |sets: &HashMap<[u8; 8], Assembly>, only: Option<u64>| {
+                sets.iter()
+                    .filter(|(_, s)| only.is_none_or(|o| s.origin == o))
+                    .min_by_key(|(_, s)| (s.parts.len(), std::cmp::Reverse(s.started_ms)))
+                    .map(|(id, _)| *id)
+            };
+            let evict = if own >= MAX_SETS_PER_ORIGIN {
+                victim(&self.sets, Some(origin))
+            } else if self.sets.len() >= MAX_ACTIVE_SETS {
+                victim(&self.sets, None)
+            } else {
+                None
+            };
+            if let Some(id) = evict {
+                self.remove(&id);
             }
             self.sets.insert(
                 f.id,
                 Assembly {
+                    origin,
                     original_type: f.original_type,
                     total: f.total,
                     parts: HashMap::new(),
@@ -251,7 +276,7 @@ mod tests {
         // Out-of-order delivery is fine.
         for f in frags.iter().rev() {
             let wire = Packet::decode(&f.encode_for_ble().unwrap()).unwrap();
-            out = r.push(&wire, 0).or(out);
+            out = r.push(&wire, 0, 1).or(out);
         }
         let whole = out.unwrap();
         assert_eq!(whole.payload, original.payload);
@@ -271,7 +296,7 @@ mod tests {
         p.signature = Some(sig);
         let frags = split(&p, 512).unwrap();
         let mut r = Reassembler::new();
-        let whole = frags.iter().find_map(|f| r.push(f, 0)).unwrap();
+        let whole = frags.iter().find_map(|f| r.push(f, 0, 1)).unwrap();
         assert_eq!(whole.signature, Some(sig));
         assert_eq!(whole.payload, p.payload);
     }
@@ -303,10 +328,49 @@ mod tests {
             p.payload = FragmentPayload { id: [5; 8], index, total, original_type: 2, data: vec![1] }.encode();
             p
         };
-        assert!(r.push(&mk(3, 0), 0).is_none());
+        assert!(r.push(&mk(3, 0), 0, 1).is_none());
         assert_eq!(r.active_sets(), 1);
-        assert!(r.push(&mk(4, 1), 0).is_none());
+        assert!(r.push(&mk(4, 1), 0, 1).is_none());
         assert_eq!(r.active_sets(), 0);
+    }
+
+    #[test]
+    fn one_link_cannot_fill_every_slot() {
+        let mut r = Reassembler::new();
+        // A new sender ID on every fragment: the quota still holds, since
+        // it's keyed on the link.
+        let frag = |sender: u8, id: u8, t: u64| {
+            let mut p = Packet::new(MessageType::Fragment, crate::PeerId([sender; 8]), Vec::new());
+            p.timestamp = t;
+            p.payload = FragmentPayload { id: [id; 8], index: 0, total: 2, original_type: 2, data: vec![1] }.encode();
+            p
+        };
+        for i in 0..100u8 {
+            r.push(&frag(i, i, i as u64), i as u64, 7);
+        }
+        assert_eq!(r.active_sets(), MAX_SETS_PER_ORIGIN);
+        // Another link still gets slots.
+        r.push(&frag(2, 200, 0), 1000, 8);
+        assert_eq!(r.active_sets(), MAX_SETS_PER_ORIGIN + 1);
+    }
+
+    #[test]
+    fn a_nearly_done_set_survives_a_flood() {
+        let mut r = Reassembler::new();
+        let frag = |id: u8, index: u16, total: u16| {
+            let mut p = Packet::new(MessageType::Fragment, crate::PeerId([1; 8]), Vec::new());
+            p.payload = FragmentPayload { id: [id; 8], index, total, original_type: 2, data: vec![1] }.encode();
+            p
+        };
+        // A real transfer, 9 of 10 parts in, from link 1.
+        for i in 0..9 {
+            r.push(&frag(250, i, 10), 0, 1);
+        }
+        // Floods from many links fill every slot.
+        for i in 0..200u8 {
+            r.push(&frag(i, 0, 2), 1, 100 + i as u64);
+        }
+        assert!(r.sets.contains_key(&[250; 8]));
     }
 
     #[test]
@@ -314,11 +378,11 @@ mod tests {
         let mut r = Reassembler::new();
         let mut p = Packet::new(MessageType::Fragment, crate::PeerId([1; 8]), Vec::new());
         p.payload = FragmentPayload { id: [5; 8], index: 0, total: 257, original_type: 2, data: vec![1] }.encode();
-        assert!(r.push(&p, 0).is_none());
+        assert!(r.push(&p, 0, 1).is_none());
         assert_eq!(r.active_sets(), 0);
 
         p.payload = FragmentPayload { id: [6; 8], index: 0, total: 2, original_type: 2, data: vec![1] }.encode();
-        r.push(&p, 0);
+        r.push(&p, 0, 1);
         r.expire(TIMEOUT_MS);
         assert_eq!(r.active_sets(), 1);
         r.expire(TIMEOUT_MS + 1);

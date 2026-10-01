@@ -35,3 +35,17 @@ jobs:
       - run: node --test tests/*.test.js
       - run: jq empty manifest.json
       - run: bash -n dist/install.sh && bash -n dist/uninstall.sh
+
+  install:
+    name: install.sh / uninstall.sh (sandboxed HOME, stubbed systemctl)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0   # gen-known-hashes.sh --check walks main and the tags
+      - run: for f in dist/*.sh tests/install/*.sh tests/install/cases/*.sh tests/install/stubs/*; do bash -n "$f" || exit 1; done
+      # This checkout's unit is listed, and every listed hash is one a fresh
+      # generation produces (so a hand-added hash fails).
+      - run: dist/gen-known-hashes.sh --check
+      - run: bash tests/install/run.sh

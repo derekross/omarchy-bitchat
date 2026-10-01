@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "derekross.bitchat",
   "name": "Bitchat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Derek Ross",
   "license": "MIT",
   "description": "Chat on the bitchat Bluetooth mesh from the Omarchy bar: peers in range on the bar, #mesh in the panel. Talks to the same bitchat apps on Android and iOS. Needs the bitchatd daemon: run dist/install.sh.",

@@ -26,6 +26,18 @@ test("display names", () => {
   assert.equal(M.displayName("bob", ""), "bob")
 })
 
+test("ambiguous nicknames get a longer tag", () => {
+  const peers = [{ nickname: "alice" }, { nickname: "Alice " }, { nickname: "bob" }]
+  const amb = M.ambiguousNames(peers)
+  assert.ok(M.isAmbiguous(amb, "ALICE"))
+  assert.ok(!M.isAmbiguous(amb, "bob"))
+  assert.equal(M.displayName("alice", "1a2b3c4d5e6f7a8b", true), "alice#1a2b3c4d")
+})
+
+test("markup is escaped for notifications", () => {
+  assert.equal(M.escapeMarkup("<b>hi</b> & 'x'"), "&lt;b&gt;hi&lt;/b&gt; &amp; &#39;x&#39;")
+})
+
 test("nick hue is stable and in range", () => {
   const a = M.nickHue("1a2b3c4d5e6f7a8b")
   assert.equal(a, M.nickHue("1a2b3c4d5e6f7a8b"))

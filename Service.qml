@@ -12,7 +12,13 @@ Item {
   property var shell: null
   property var manifest: null
 
-  readonly property string socketPath: Quickshell.env("XDG_RUNTIME_DIR") + "/bitchat.sock"
+  readonly property string socketPath: Quickshell.env("XDG_RUNTIME_DIR") + "/bitchat/bitchat.sock"
+  // Where bitchatd before 0.2 listened. After `omarchy plugin update` the
+  // old daemon keeps running there until dist/install.sh is run again.
+  readonly property string legacySocketPath: Quickshell.env("XDG_RUNTIME_DIR") + "/bitchat.sock"
+  property int _attempt: 0
+  property string _tryingPath: ""
+  property bool outdatedDaemon: false
 
   // Our own record of the link: Socket.connected is also the *requested*
   // state, so it can read true after a failed attempt.
@@ -132,10 +138,25 @@ Item {
     }
   }
 
+  // The notification card renders a little markup, so everything from the
+  // mesh is escaped (after truncating, so no entity is cut in half). Toasts
+  // are rate-limited: a flood of @mentions becomes one "and N more".
+  property double _lastNotify: 0
+  property int _foldedNotifications: 0
   function notifyMessage(m) {
-    var title = Model.displayName(m.nickname, m.senderId) + " on #mesh"
+    var now = Date.now()
+    if (now - root._lastNotify < Model.NOTIFY_MIN_GAP_MS) {
+      root._foldedNotifications++
+      return
+    }
+    var more = root._foldedNotifications
+    root._lastNotify = now
+    root._foldedNotifications = 0
+    var who = Model.displayName(m.nickname, m.senderId, Model.isAmbiguous(Model.ambiguousNames(root.peers), m.nickname))
+    var title = Model.escapeMarkup(who) + " on #mesh"
+    var body = Model.escapeMarkup(Model.truncate(m.text, 200)) + (more > 0 ? " (and " + more + " more)" : "")
     Quickshell.execDetached(["omarchy-notification-send", "--app-name", "Bitchat", "-g", "󰍡",
-      Model.safeArg(title), Model.safeArg(Model.truncate(m.text, 200))])
+      Model.safeArg(title), Model.safeArg(body)])
   }
 
   // Quickshell's Socket won't retry after a failed attempt, so each attempt
@@ -161,6 +182,7 @@ Item {
     root.linked = up
     if (up) {
       root.everConnected = true
+      root.outdatedDaemon = root._tryingPath === root.legacySocketPath
       root._callbacks = ({})
       root.call("subscribe", null, function(err, s) {
         if (err) return
@@ -197,7 +219,9 @@ Item {
     try {
       var s = Qt.createQmlObject(root.sockQml, root, "BitchatSocket")
       s.owner = root
-      s.path = root.socketPath
+      // Alternate with the old path, so an old daemon is still found.
+      root._tryingPath = (root._attempt++ % 2 === 0) ? root.socketPath : root.legacySocketPath
+      s.path = root._tryingPath
       root.sock = s
       s.connected = true
     } catch (e) {
