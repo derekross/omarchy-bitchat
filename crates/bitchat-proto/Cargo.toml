@@ -1,0 +1,15 @@
+[package]
+name = "bitchat-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "bitchat mesh wire protocol: packets, padding, compression, fragments, announces, signing"
+
+[dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+flate2 = "1"
+rand = "0.8"
+sha2 = "0.10"
+thiserror = "2"

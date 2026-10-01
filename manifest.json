@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "id": "derekross.bitchat",
+  "name": "Bitchat",
+  "version": "0.1.0",
+  "author": "Derek Ross",
+  "license": "MIT",
+  "description": "Chat on the bitchat Bluetooth mesh from the Omarchy bar: peers in range on the bar, #mesh in the panel. Talks to the same bitchat apps on Android and iOS. Needs the bitchatd daemon: run dist/install.sh.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Bitchat",
+    "description": "bitchat mesh chat: peers in range on the bar, #mesh in the popup.",
+    "category": "Communication",
+    "aliases": [
+      "bitchat",
+      "mesh",
+      "bluetooth chat",
+      "chat"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "notify": "mentions",
+      "showPeerCount": true,
+      "persistHistory": true,
+      "clock24h": true
+    },
+    "schema": [
+      {
+        "key": "notify",
+        "type": "enum",
+        "label": "Notifications",
+        "description": "mentions = only messages with @yourname. Never while the panel is open.",
+        "options": ["mentions", "all", "off"],
+        "defaultValue": "mentions"
+      },
+      {
+        "key": "showPeerCount",
+        "type": "boolean",
+        "label": "Show peer count on the bar",
+        "defaultValue": true
+      },
+      {
+        "key": "persistHistory",
+        "type": "boolean",
+        "label": "Keep chat history",
+        "description": "Save the last 500 #mesh messages so they survive a restart. Off deletes the saved history.",
+        "defaultValue": true
+      },
+      {
+        "key": "clock24h",
+        "type": "boolean",
+        "label": "24-hour times",
+        "defaultValue": true
+      }
+    ]
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "bitchatctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line client for bitchatd"
+
+[[bin]]
+name = "bitchatctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
