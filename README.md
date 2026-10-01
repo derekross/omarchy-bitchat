@@ -1,5 +1,7 @@
 # Omarchy Bitchat
 
+![The #mesh panel, chatting with an Android phone running bitchat](preview.png)
+
 [bitchat](https://github.com/permissionlesstech/bitchat) mesh chat in the [Omarchy](https://omarchy.org) bar. Your laptop joins the same Bluetooth mesh as the bitchat apps on Android and iOS: it finds phones nearby, relays their traffic, and lets you talk in `#mesh` without internet, accounts or servers.
 
 - **On the bar:** a chat glyph with the number of peers in range. It lights up when there's something unread. Left click opens the panel, right click opens it ready to type, middle click turns the mesh on or off.
